@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Grand Luxury Interactive Christmas Tree</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "react": "https://esm.sh/react@18.2.0",
+            "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+            "three": "https://esm.sh/three@0.160.0",
+            "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.15.16?external=react,react-dom,three",
+            "@react-three/drei": "https://esm.sh/@react-three/drei@9.99.0?external=react,react-dom,three,@react-three/fiber",
+            "@react-three/postprocessing": "https://esm.sh/@react-three/postprocessing@2.16.0?external=react,react-dom,three,@react-three/fiber",
+            "@react-three/cannon": "https://esm.sh/@react-three/cannon@6.6.0?external=react,react-dom,three,@react-three/fiber",
+            "uuid": "https://esm.sh/uuid@9.0.1"
+        }
+    }
+    </script>
+
+    <style>
+        body {
+            margin: 0;
+            background-color: #000500;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        
+        /* 玻璃拟态与光效 CSS */
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+        }
+        
+        .luxury-text {
+            text-shadow: 0 0 20px rgba(212, 175, 55, 0.4);
+            background: linear-gradient(to bottom, #FFD700, #B8860B);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        @keyframes pulse-gold {
+            0%, 100% { box-shadow: 0 0 10px rgba(212, 175, 55, 0.2); }
+            50% { box-shadow: 0 0 25px rgba(212, 175, 55, 0.6); }
+        }
+
+        .animate-pulse-gold {
+            animation: pulse-gold 3s infinite;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useRef, useMemo, useState, useEffect } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import * as THREE from 'three';
+        import { Canvas, useFrame, useThree } from '@react-three/fiber';
+        import { OrbitControls, Environment, PerspectiveCamera } from '@react-three/drei';
+        import { EffectComposer, Bloom } from '@react-three/postprocessing';
+        import { Physics, InstancedRigidBodies } from '@react-three/cannon';
+
+        // --- 配置参数 ---
+        const TREE_HEIGHT = 14;
+        const TREE_RADIUS = 5;
+        const ORNAMENT_COUNT = 150; // 物理物体数量
+
+        // --- Shaders ---
+        const foliageVertexShader = `
+          uniform float uTime;
+          uniform float uProgress;
+          attribute vec3 aTargetPos;
+          attribute vec3 aChaosPos;
+          attribute float aSize;
+          varying vec3 vColor;
+          
+          float cubicBezier(float t, float p0, float p1, float p2, float p3) {
+            float u = 1.0 - t;
+            float tt = t * t;
+            float uu = u * u;
+            float uuu = uu * u;
+            float ttt = tt * t;
+            return uuu * p0 + 3.0 * uu * t * p1 + 3.0 * u * tt * p2 + ttt * p3;
+          }
+
+          void main() {
+            vec3 pos = mix(aTargetPos, aChaosPos, cubicBezier(uProgress, 0.0, 0.1, 0.9, 1.0));
+            pos += vec3(sin(uTime * 2.0 + pos.y), cos(uTime * 1.5 + pos.x), 0.0) * 0.05;
+            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+            gl_PointSize = aSize * (300.0 / -mvPosition.z);
+            vColor = mix(vec3(0.0, 0.3, 0.1), vec3(1.0, 0.8, 0.4), uProgress * 0.6);
+          }
+        `;
+
+        const foliageFragmentShader = `
+          varying vec3 vColor;
+          void main() {
+            float r = distance(gl_PointCoord, vec2(0.5));
+            if (r > 0.5) discard;
+            float glow = 1.0 - (r * 1.8);
+            glow = pow(glow, 1.5);
+            gl_FragColor = vec4(vColor + glow * 0.5, 0.8);
+          }
+        `;
+
+        // --- 组件: 针叶系统 (GPU 渲染) ---
+        const FoliageSystem = ({ isUnleashed }) => {
+          const count = 12000;
+          const shaderRef = useRef(null);
+          
+          const { positions, targetPos, chaosPos, sizes } = useMemo(() => {
+            const tPos = new Float32Array(count * 3);
+            const cPos = new Float32Array(count * 3);
+            const s = new Float32Array(count);
+
+            for (let i = 0; i < count; i++) {
+              // 树
+              const y = (Math.random() * TREE_HEIGHT) - TREE_HEIGHT / 2;
+              const r = (1 - (y + TREE_HEIGHT / 2) / TREE_HEIGHT) * TREE_RADIUS;
+              const theta = y * 4.0 + Math.random() * Math.PI * 2;
+              const rFinal = r * Math.sqrt(Math.random()); 
+              tPos[i * 3] = Math.cos(theta) * rFinal;
+              tPos[i * 3 + 1] = y;
+              tPos[i * 3 + 2] = Math.sin(theta) * rFinal;
+
+              // 混沌
+              const phi = Math.acos(2 * Math.random() - 1);
+              const cTheta = Math.random() * Math.PI * 2;
+              const cR = 8 + Math.random() * 8;
+              cPos[i * 3] = cR * Math.sin(phi) * Math.cos(cTheta);
+              cPos[i * 3 + 1] = cR * Math.sin(phi) * Math.sin(cTheta);
+              cPos[i * 3 + 2] = cR * Math.cos(phi);
+
+              s[i] = Math.random() * 0.15 + 0.05;
+            }
+            return { positions: tPos, targetPos: tPos, chaosPos: cPos, sizes: s };
+          }, []);
+
+          useFrame((state) => {
+            if (shaderRef.current) {
+              shaderRef.current.uniforms.uTime.value = state.clock.elapsedTime;
+              shaderRef.current.uniforms.uProgress.value = THREE.MathUtils.lerp(
+                shaderRef.current.uniforms.uProgress.value,
+                isUnleashed ? 1.0 : 0.0,
+                0.05
+              );
+            }
+          });
+
+          return (
+            <points>
+              <bufferGeometry>
+                <bufferAttribute attach="attributes-position" count={count} array={positions} itemSize={3} />
+                <bufferAttribute attach="attributes-aTargetPos" count={count} array={targetPos} itemSize={3} />
+                <bufferAttribute attach="attributes-aChaosPos" count={count} array={chaosPos} itemSize={3} />
+                <bufferAttribute attach="attributes-aSize" count={count} array={sizes} itemSize={1} />
+              </bufferGeometry>
+              <shaderMaterial
+                ref={shaderRef}
+                vertexShader={foliageVertexShader}
+                fragmentShader={foliageFragmentShader}
+                uniforms={{ uTime: { value: 0 }, uProgress: { value: 0 } }}
+                transparent
+                depthWrite={false}
+                blending={THREE.AdditiveBlending}
+              />
+            </points>
+          );
+        };
+
+        // --- 组件: 物理控制器 ---
+        const PhysicsController = ({ isUnleashed, data, api }) => {
+            useFrame((state) => {
+                const time = state.clock.elapsedTime;
+                // 注意：Web版为了性能，我们这里进行简化的物理控制
+                // 真正的物理循环在 Physics 组件内部
+                if(isUnleashed && api.current) {
+                    for (let i = 0; i < data.length; i++) {
+                         const noiseX = Math.sin(time + i) * 0.5;
+                         const noiseY = Math.cos(time * 0.5 + i) * 0.5;
+                         const noiseZ = Math.sin(time * 0.3 + i * 2) * 0.5;
+                         api.current.at(i).applyForce([noiseX, noiseY, noiseZ], [0, 0, 0]);
+                         api.current.at(i).applyTorque([noiseX * 0.1, noiseY * 0.1, noiseZ * 0.1]);
+                    }
+                }
+            });
+            
+            useEffect(() => {
+                if (!api.current) return;
+                
+                if (isUnleashed) {
+                    // 爆发
+                    for (let i = 0; i < data.length; i++) {
+                        const dir = new THREE.Vector3(data[i].target.x, data[i].target.y, data[i].target.z).normalize().multiplyScalar(5);
+                        api.current.at(i).wakeUp();
+                        api.current.at(i).applyImpulse([dir.x, dir.y, dir.z], [0, 0, 0]);
+                        api.current.at(i).applyTorque([Math.random()*2, Math.random()*2, Math.random()*2]);
+                    }
+                } else {
+                    // 归位
+                     for (let i = 0; i < data.length; i++) {
+                        api.current.at(i).sleep();
+                        api.current.at(i).position.set(data[i].target.x, data[i].target.y, data[i].target.z);
+                        api.current.at(i).rotation.set(0,0,0);
+                        api.current.at(i).velocity.set(0,0,0);
+                        api.current.at(i).angularVelocity.set(0,0,0);
+                     }
+                }
+            }, [isUnleashed]);
+
+            return null;
+        }
+
+        // --- 组件: 物理装饰物 ---
+        const PhysicsOrnaments = ({ isUnleashed }) => {
+          const [data] = useState(() => {
+            return new Array(ORNAMENT_COUNT).fill(0).map(() => {
+                const y = (Math.random() * TREE_HEIGHT) - TREE_HEIGHT / 2;
+                const radius = (1 - (y + TREE_HEIGHT / 2) / TREE_HEIGHT) * TREE_RADIUS * 0.9;
+                const angle = Math.random() * Math.PI * 2;
+                const x = Math.cos(angle) * radius;
+                const z = Math.sin(angle) * radius;
+                const color = Math.random() > 0.6 ? '#8B0000' : (Math.random() > 0.5 ? '#D4AF37' : '#FFFFFF');
+                return { 
+                  target: {x, y, z}, 
+                  scale: 0.4 + Math.random() * 0.3,
+                  color 
+                };
+            });
+          });
+
+          const api = useRef(null);
+          const instancesRef = useRef(null);
+
+          useEffect(() => {
+            if(instancesRef.current) {
+                data.forEach((d, i) => {
+                    const c = new THREE.Color(d.color);
+                    instancesRef.current.setColorAt(i, c);
+                });
+                instancesRef.current.instanceMatrix.needsUpdate = true;
+            }
+          }, []);
+
+          return (
+            <InstancedRigidBodies
+                ref={api}
+                positions={data.map(d => [d.target.x, d.target.y, d.target.z])}
+                rotations={data.map(() => [Math.random()*Math.PI, Math.random()*Math.PI, 0])}
+                scales={data.map(d => [d.scale, d.scale, d.scale])}
+                mass={1}
+                linearDamping={isUnleashed ? 0.1 : 0.9}
+                angularDamping={isUnleashed ? 0.1 : 0.9}
+                args={[undefined, undefined, ORNAMENT_COUNT]} 
+            >
+              <instancedMesh ref={instancesRef} args={[undefined, undefined, ORNAMENT_COUNT]} castShadow receiveShadow>
+                <boxGeometry args={[1, 1, 1]} />
+                <meshPhysicalMaterial 
+                    roughness={0.1} 
+                    metalness={0.8} 
+                    clearcoat={1}
+                    color="#ffffff"
+                />
+                <PhysicsController isUnleashed={isUnleashed} data={data} api={api} />
+              </instancedMesh>
+            </InstancedRigidBodies>
+          );
+        };
+
+        // --- 场景 ---
+        const Scene = ({ isUnleashed }) => {
+          return (
+            <>
+              <PerspectiveCamera makeDefault position={[0, 2, 25]} />
+              <OrbitControls enablePan={false} autoRotate={!isUnleashed} autoRotateSpeed={0.5} dampingFactor={0.05} />
+
+              <ambientLight intensity={0.2} />
+              <pointLight position={[10, 10, 10]} intensity={1.0} color="#FFD700" />
+              <pointLight position={[-10, -5, -10]} intensity={0.5} color="#8B0000" />
+              <pointLight position={[0, 0, 0]} intensity={2} distance={15} decay={2} color="#FFA500" />
+
+              <Environment preset="city" />
+
+              <FoliageSystem isUnleashed={isUnleashed} />
+
+              {/* 物理世界: 零重力 */}
+              <Physics gravity={[0, 0, 0]}>
+                 <PhysicsOrnaments isUnleashed={isUnleashed} />
+              </Physics>
+
+              <EffectComposer disableNormalPass>
+                <Bloom luminanceThreshold={0.9} mipmapBlur intensity={1.5} radius={0.5} />
+              </EffectComposer>
+            </>
+          );
+        };
+
+        // --- UI ---
+        const UI = ({ isUnleashed, setUnleashed }) => {
+          return (
+            <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-8 z-10 font-sans">
+              <div className="flex justify-between items-start">
+                <div className="glass-panel p-6 rounded-2xl">
+                  <h1 className="text-3xl font-bold luxury-text tracking-widest uppercase mb-1">
+                    Grand Luxury
+                  </h1>
+                  <p className="text-xs text-amber-100/60 tracking-[0.3em]">INTERACTIVE CHRISTMAS TREE</p>
+                </div>
+                <div className="glass-panel px-4 py-2 rounded-full text-xs text-amber-200">
+                   FPS: 60 • HDR: ON
+                </div>
+              </div>
+
+              <div className="w-full flex justify-center pb-10">
+                <button
+                  className={`
+                    pointer-events-auto
+                    relative group overflow-hidden
+                    px-12 py-4 rounded-xl
+                    border border-amber-500/30
+                    backdrop-blur-xl
+                    transition-all duration-500 ease-out
+                    ${isUnleashed ? 'bg-amber-900/40 scale-95' : 'bg-black/40 hover:scale-105 animate-pulse-gold'}
+                  `}
+                  onPointerDown={() => setUnleashed(true)}
+                  onPointerUp={() => setUnleashed(false)}
+                  onPointerLeave={() => setUnleashed(false)}
+                  onTouchStart={() => setUnleashed(true)}
+                  onTouchEnd={(e) => { e.preventDefault(); setUnleashed(false); }}
+                >
+                    <div className="absolute inset-0 bg-gradient-to-r from-transparent via-amber-400/20 to-transparent translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000"></div>
+                    <span className={`text-sm font-bold tracking-[0.2em] uppercase ${isUnleashed ? 'text-red-400' : 'text-amber-300'}`}>
+                        {isUnleashed ? 'Reforming...' : 'Unleash Chaos'}
+                    </span>
+                </button>
+              </div>
+            </div>
+          );
+        };
+
+        // --- App ---
+        const App = () => {
+          const [isUnleashed, setUnleashed] = useState(false);
+
+          return (
+            <div className="w-full h-screen relative bg-[#000500]">
+              <Canvas dpr={[1, 2]} shadows gl={{ antialias: false, toneMapping: THREE.ReinhardToneMapping }}>
+                <Scene isUnleashed={isUnleashed} />
+              </Canvas>
+              <UI isUnleashed={isUnleashed} setUnleashed={setUnleashed} />
+            </div>
+          );
+        }
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
